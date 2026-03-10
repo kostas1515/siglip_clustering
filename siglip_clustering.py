@@ -1,5 +1,6 @@
 import argparse
-import shutil
+import json
+import os
 import tarfile
 import tempfile
 from collections import defaultdict
@@ -8,58 +9,101 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
 from sklearn.cluster import KMeans
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoProcessor
 
-# Main function to process webdataset shards and cluster them based on aggregated video-clip embeddings.
+# Main function to process webdataset shards and cluster video clips based on clip embeddings.
 def process_images(image_directory, model_name, num_clusters, batch_size, num_frames):
     image_directory = Path(image_directory)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    distributed, rank, world_size, local_rank, device = init_distributed()
 
-    embeddings_file = image_directory / "embeddings.npy"
-    regenerate_embeddings = check_and_load_embeddings(embeddings_file)
-
-    model = AutoModel.from_pretrained(model_name).to(device)
-    processor = AutoProcessor.from_pretrained(model_name)
-    model.eval()
+    embeddings_file = image_directory / "clip_embeddings.npy"
+    clip_ids_file = image_directory / "clip_ids.npy"
+    corrupted_file = image_directory / "corrupted_shards.json"
     allowed_extensions = {".tar"}
-
     shards_to_paths, all_shard_ids = get_images_to_paths(image_directory, allowed_extensions)
-    valid_shard_ids, damaged_shard_ids, all_embeddings = generate_embeddings(
-        all_shard_ids,
-        shards_to_paths,
-        model,
-        processor,
-        device,
-        batch_size,
-        num_frames,
-        regenerate_embeddings,
-        embeddings_file,
-    )
+
+    regenerate_embeddings = check_and_load_embeddings(embeddings_file, rank)
+    valid_clip_ids = []
+    damaged_shard_ids = set()
+    all_embeddings = None
 
     if regenerate_embeddings:
-        np.save(embeddings_file, all_embeddings)
+        model = AutoModel.from_pretrained(model_name).to(device)
+        if distributed and device.type == "cuda":
+            model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(model_name)
+
+        local_shard_ids = all_shard_ids[rank::world_size]
+        local_clip_ids, local_damaged_shard_ids, local_embeddings = generate_embeddings(
+            local_shard_ids,
+            shards_to_paths,
+            model,
+            processor,
+            device,
+            batch_size,
+            num_frames,
+        )
+
+        valid_clip_ids, damaged_shard_ids, all_embeddings = gather_embedding_results(
+            local_clip_ids,
+            local_damaged_shard_ids,
+            local_embeddings,
+            distributed,
+            rank,
+            world_size,
+        )
+
+        if rank == 0:
+            np.save(embeddings_file, all_embeddings)
+            np.save(clip_ids_file, np.asarray(valid_clip_ids))
+            corrupted_file.write_text(json.dumps(sorted(damaged_shard_ids), indent=2))
+            all_embeddings = np.load(embeddings_file, mmap_mode="r")
+    elif rank == 0:
+        valid_clip_ids = np.load(clip_ids_file).tolist()
+        damaged_shard_ids = set(json.loads(corrupted_file.read_text())) if corrupted_file.exists() else set()
+        all_embeddings = np.load(embeddings_file, mmap_mode="r")
+
+    if distributed:
+        dist.barrier()
+
+    if rank != 0:
+        cleanup_distributed(distributed)
+        return
 
     if len(all_embeddings) < 2:
-        print("Not enough valid shards to cluster.")
-        organize_images(shards_to_paths, image_directory, {}, damaged_shard_ids)
+        print("Not enough valid clips to cluster.")
+        write_cluster_manifests(image_directory, {}, damaged_shard_ids)
+        cleanup_distributed(distributed)
         return
 
     print("Applying k-means clustering...")
     labels = apply_clustering(all_embeddings, num_clusters)
 
-    shard_id_clusters = build_image_clusters(valid_shard_ids, labels)
-    organize_images(shards_to_paths, image_directory, shard_id_clusters, damaged_shard_ids)
+    clip_id_clusters = build_image_clusters(valid_clip_ids, labels)
+    write_cluster_manifests(image_directory, clip_id_clusters, damaged_shard_ids)
+    cleanup_distributed(distributed)
 
 # Check for existing embeddings file and load it if found, otherwise generate new embeddings
-def check_and_load_embeddings(embeddings_file):
-    if embeddings_file.exists():
+def check_and_load_embeddings(embeddings_file, rank):
+    reuse_embeddings = False
+    if rank == 0 and embeddings_file.exists():
         use_existing_embeddings = input("Embeddings file found. Do you want to use existing embeddings? (Y/N) ").strip().lower()
-        if use_existing_embeddings in ("", "y", "yes"):
-            print("Loading embeddings from file...")
-            return False
+        reuse_embeddings = use_existing_embeddings in ("", "y", "yes")
+
+    if dist.is_available() and dist.is_initialized():
+        decisions = [reuse_embeddings]
+        dist.broadcast_object_list(decisions, src=0)
+        reuse_embeddings = decisions[0]
+
+    if reuse_embeddings:
+        print("Loading embeddings from file...")
+        return False
     return True
 
 # Get the paths of all tar shards in the given directory and return the shard ids and their paths.
@@ -71,16 +115,15 @@ def get_images_to_paths(image_directory, allowed_extensions):
     }
     return images_to_paths, list(images_to_paths.keys())
 
-# Generate one embedding per tar shard by averaging normalized clip embeddings across its video samples.
-def generate_embeddings(all_image_ids, images_to_paths, model, processor, device, batch_size, num_frames, regenerate_embeddings, embeddings_file):
-    if not regenerate_embeddings:
-        return all_image_ids, set(), np.load(embeddings_file)
-
-    valid_image_ids, damaged_image_ids, all_embeddings = [], set(), []
-    progress_bar = tqdm(total=len(all_image_ids), desc="Generating shard embeddings")
+# Generate one embedding per video clip found inside the assigned tar shards.
+def generate_embeddings(all_image_ids, images_to_paths, model, processor, device, batch_size, num_frames):
+    valid_clip_ids, damaged_image_ids, all_embeddings = [], set(), []
+    show_progress = not (dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)
+    progress_bar = tqdm(total=len(all_image_ids), desc="Generating clip embeddings", disable=not show_progress)
 
     for shard_id in all_image_ids:
-        shard_embedding = build_shard_embedding(
+        clip_records = build_shard_embedding(
+            shard_id,
             images_to_paths[shard_id],
             model,
             processor,
@@ -88,36 +131,27 @@ def generate_embeddings(all_image_ids, images_to_paths, model, processor, device
             batch_size,
             num_frames,
         )
-        if shard_embedding is None:
+        if not clip_records:
             print(f"\nError processing shard {images_to_paths[shard_id]}, marking as corrupted or empty.")
             damaged_image_ids.add(shard_id)
         else:
-            valid_image_ids.append(shard_id)
-            all_embeddings.append(shard_embedding)
+            for clip_id, clip_embedding in clip_records:
+                valid_clip_ids.append(clip_id)
+                all_embeddings.append(clip_embedding)
         progress_bar.update(1)
 
     progress_bar.close()
-    return valid_image_ids, damaged_image_ids, all_embeddings
+    return valid_clip_ids, damaged_image_ids, all_embeddings
 
-def build_shard_embedding(shard_path, model, processor, device, batch_size, num_frames):
-    clip_embedding_sum = None
-    clip_count = 0
+def build_shard_embedding(shard_id, shard_path, model, processor, device, batch_size, num_frames):
+    clip_records = []
 
-    for clip_frames in iter_shard_videos(shard_path, num_frames):
+    for clip_name, clip_frames in iter_shard_videos(shard_path, num_frames):
         clip_embedding = build_clip_embedding(clip_frames, model, processor, device, batch_size)
         if clip_embedding is not None:
-            if clip_embedding_sum is None:
-                clip_embedding_sum = clip_embedding.clone()
-            else:
-                clip_embedding_sum += clip_embedding
-            clip_count += 1
+            clip_records.append((f"{shard_id}::{clip_name}", clip_embedding.numpy()))
 
-    if clip_count == 0:
-        return None
-
-    shard_tensor = clip_embedding_sum / clip_count
-    shard_tensor = torch.nn.functional.normalize(shard_tensor, p=2, dim=-1)
-    return shard_tensor.to(dtype=torch.float32).numpy()
+    return clip_records
 
 
 def build_clip_embedding(clip_frames, model, processor, device, batch_size):
@@ -162,7 +196,7 @@ def iter_shard_videos(shard_path, num_frames):
                     video_bytes = extracted.read()
                     clip_frames = sample_video_frames(video_bytes, num_frames)
                     if clip_frames:
-                        yield clip_frames
+                        yield member.name, clip_frames
                 except Exception:
                     continue
     except tarfile.TarError:
@@ -204,6 +238,9 @@ def sample_video_frames(video_bytes, num_frames):
 
 
 def extract_image_features(model, model_inputs):
+    if isinstance(model, DDP):
+        model = model.module
+
     if hasattr(model, "get_image_features"):
         return model.get_image_features(**model_inputs)
 
@@ -217,7 +254,7 @@ def extract_image_features(model, model_inputs):
 
     raise AttributeError("Model does not expose image embeddings via get_image_features, image_embeds, or pooler_output.")
 
-# Apply k-means clustering directly on shard embeddings.
+# Apply k-means directly on clip embeddings.
 def apply_clustering(all_embeddings, num_clusters):
     embeddings = np.asarray(all_embeddings, dtype=np.float32)
     effective_clusters = min(num_clusters, len(embeddings))
@@ -227,7 +264,7 @@ def apply_clustering(all_embeddings, num_clusters):
     model = KMeans(n_clusters=effective_clusters, random_state=0, n_init="auto")
     return model.fit_predict(embeddings)
 
-# Build clusters of shard ids based on the clustering labels.
+# Build clusters of clip ids based on the clustering labels.
 def build_image_clusters(all_image_ids, labels):
     image_id_clusters = defaultdict(set)
 
@@ -236,35 +273,75 @@ def build_image_clusters(all_image_ids, labels):
 
     return image_id_clusters
 
-# Organize shards into separate folders for clusters, unique shards, and corrupted shards.
-def organize_images(images_to_paths, image_directory, image_id_clusters, damaged_image_ids):
-    clustered_image_ids = set()
-
-    for idx, image_id_cluster in enumerate(image_id_clusters.values()):
-        if len(image_id_cluster) < 2:
-            continue
-
-        clustered_image_ids.update(image_id_cluster)
-        move_images_to_directory(image_directory, f"cluster_{idx}", image_id_cluster, images_to_paths)
-
-    unique_image_ids = set(images_to_paths.keys()) - set(damaged_image_ids) - clustered_image_ids
-    move_images_to_directory(image_directory, "unique", unique_image_ids, images_to_paths)
-
-    if damaged_image_ids:
-        move_images_to_directory(image_directory, "corrupted", damaged_image_ids, images_to_paths)
-
-# Move shards to the specified folder within the image_directory.
-def move_images_to_directory(image_directory, folder_name, image_ids, images_to_paths):
-    output_directory = image_directory / folder_name
+def write_cluster_manifests(image_directory, image_id_clusters, damaged_image_ids):
+    output_directory = image_directory / "clip_clusters"
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    for image_id in image_ids:
-        source = images_to_paths[image_id]
-        destination = output_directory / source.name
-        shutil.move(source, destination)
+    for cluster_idx, clip_ids in image_id_clusters.items():
+        manifest_path = output_directory / f"cluster_{cluster_idx}.txt"
+        manifest_path.write_text("\n".join(sorted(clip_ids)) + "\n" if clip_ids else "")
+
+    corrupted_manifest = output_directory / "corrupted_shards.txt"
+    corrupted_manifest.write_text("\n".join(sorted(damaged_image_ids)) + "\n" if damaged_image_ids else "")
+
+
+def init_distributed():
+    env_keys = {"RANK", "WORLD_SIZE", "LOCAL_RANK"}
+    if not dist.is_available() or not env_keys.issubset(os.environ):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return False, 0, 1, 0, device
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+
+    return True, rank, world_size, local_rank, device
+
+
+def cleanup_distributed(distributed):
+    if distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def gather_embedding_results(local_clip_ids, local_damaged_shard_ids, local_embeddings, distributed, rank, world_size):
+    if not distributed:
+        return local_clip_ids, local_damaged_shard_ids, np.asarray(local_embeddings, dtype=np.float32)
+
+    gathered_results = [None] * world_size
+    dist.all_gather_object(
+        gathered_results,
+        {
+            "clip_ids": local_clip_ids,
+            "damaged_ids": list(local_damaged_shard_ids),
+            "embeddings": local_embeddings,
+        },
+    )
+
+    if rank != 0:
+        return [], set(), None
+
+    clip_ids = []
+    embeddings = []
+    damaged_ids = set()
+    for result in gathered_results:
+        damaged_ids.update(result["damaged_ids"])
+        clip_ids.extend(result["clip_ids"])
+        embeddings.extend(result["embeddings"])
+
+    return clip_ids, damaged_ids, np.asarray(embeddings, dtype=np.float32)
+
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Finding conceptually similar webdataset tar shards using SigLIP/CLIP-style video-clip embeddings and k-means clustering.")
+    parser = argparse.ArgumentParser(description="Finding conceptually similar video clips from webdataset tar shards using SigLIP/CLIP-style clip embeddings and k-means clustering.")
     parser.add_argument("--image_directory", type=str, required=True, help="Path to the directory containing the webdataset .tar shards to cluster.")
     parser.add_argument(
         "--model_name",
