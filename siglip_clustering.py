@@ -1,10 +1,11 @@
 import argparse
 import shutil
 import tarfile
+import tempfile
 from collections import defaultdict
-from io import BytesIO
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -171,27 +172,37 @@ def iter_shard_videos(shard_path, num_frames):
 
 
 def sample_video_frames(video_bytes, num_frames):
-    try:
-        from decord import VideoReader, cpu
-    except ImportError as exc:
-        raise ImportError("decord is required to read video clips from webdataset shards.") from exc
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as temp_video_file:
+        temp_video_file.write(video_bytes)
+        temp_video_file.flush()
 
-    video_reader = VideoReader(BytesIO(video_bytes), ctx=cpu(0), num_threads=1)
-    total_frames = len(video_reader)
-    if total_frames == 0:
-        return []
+        video = cv2.VideoCapture(temp_video_file.name)
+        try:
+            total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames <= 0:
+                return []
 
-    sample_indices = np.linspace(0, total_frames - 1, num=min(num_frames, total_frames), dtype=int)
-    frame_batch = video_reader.get_batch(sample_indices).asnumpy()
-    frames = [Image.fromarray(frame).convert("RGB") for frame in frame_batch]
+            sample_indices = np.linspace(0, total_frames - 1, num=min(num_frames, total_frames), dtype=int)
+            frames = []
 
-    if not frames:
-        return []
+            for frame_idx in sample_indices:
+                video.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                success, frame = video.read()
+                if not success:
+                    continue
 
-    while len(frames) < num_frames:
-        frames.append(frames[-1].copy())
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(frame_rgb))
 
-    return frames
+            if not frames:
+                return []
+
+            while len(frames) < num_frames:
+                frames.append(frames[-1].copy())
+
+            return frames
+        finally:
+            video.release()
 
 
 def extract_image_features(model, model_inputs):
